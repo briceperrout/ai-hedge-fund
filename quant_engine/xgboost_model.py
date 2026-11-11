@@ -29,6 +29,7 @@ import xgboost as xgb
 from dotenv import load_dotenv
 
 from data_pipeline.fetch_history import TICKERS, load_dark_pool, load_macro, load_prices
+from quant_engine.filing_features import FILING_FEATURES, load_filing_features
 
 ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT / ".env")
@@ -202,13 +203,22 @@ def label_trades(prices: pd.DataFrame, atr: pd.Series, cfg: StrategyConfig) -> p
 
 
 def build_dataset(tickers: Optional[Iterable[str]] = None, cfg: Optional[StrategyConfig] = None,
-                  start: Optional[str] = None, end: Optional[str] = None
+                  start: Optional[str] = None, end: Optional[str] = None, filing_features: Optional[bool] = None
                   ) -> tuple[pd.DataFrame, dict[str, pd.DataFrame], list[str]]:
     """Assemble features + cibles de tout l'univers.
 
+    ``filing_features`` ajoute les variables extraites des dépôts SEC par le LLM (défaut : variable
+    d'environnement ENABLE_FILING_FEATURES, désactivée tant que leur intérêt n'est pas démontré).
     Retourne (dataset indexé par date avec colonne ``ticker``, prix par ticker, liste des features).
     """
     cfg = cfg or StrategyConfig.from_env()
+    if filing_features is None:
+        filing_features = os.getenv("ENABLE_FILING_FEATURES", "false").lower() == "true"
+    filing_signals = None
+    if filing_features:
+        from llm_agents.filing_extractor import load_signals
+
+        filing_signals = load_signals()
     macro_feats = macro_features(load_macro(end=end))
     frames, prices_by_ticker = [], {}
     for ticker in (tickers or TICKERS):
@@ -217,6 +227,8 @@ def build_dataset(tickers: Optional[Iterable[str]] = None, cfg: Optional[Strateg
             log.warning("%s : historique insuffisant (%d séances), ignoré.", ticker, len(prices))
             continue
         feats = build_features(prices, macro_feats, load_dark_pool(ticker))
+        if filing_signals is not None:
+            feats = feats.join(load_filing_features(ticker, feats.index, filing_signals))
         frame = feats.join(label_trades(prices, feats["atr"], cfg)).join(prices[["open", "high", "low", "close"]])
         frame.insert(0, "ticker", ticker)
         frames.append(frame)
@@ -231,6 +243,8 @@ def build_dataset(tickers: Optional[Iterable[str]] = None, cfg: Optional[Strateg
     for col in OPTIONAL_FEATURES:  # n'activer une feature alternative que si elle est réellement couverte
         if col in dataset and dataset[col].notna().mean() >= 0.5:
             features.append(col)
+    if filing_signals is not None:
+        features += [col for col in FILING_FEATURES if dataset[col].notna().any()]
     dataset = dataset.dropna(subset=TECH_FEATURES)
     return dataset, prices_by_ticker, features
 

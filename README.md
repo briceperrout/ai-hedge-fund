@@ -99,9 +99,53 @@ propre, même si le dossier qu'on lui fournit est filtré par date. La seule mes
 **paper-trading en temps réel** : le tableau de bord recalcule, pour chaque signal bloqué, ce que le
 trade serait devenu une fois son issue connue.
 
+### Le LLM comme source de variables : lecture des dépôts SEC
+
+Dans le comité, le LLM ne fait que filtrer. Une seconde piste lui donne un rôle plus défendable : lire en
+entier les 8-K, 10-Q et 10-K et en tirer des variables chiffrées que XGBoost peut exploiter.
+
+```mermaid
+flowchart LR
+    S[SEC EDGAR<br/>8-K + annexes, 10-Q, 10-K] --> T[Texte daté<br/>à la minute de publication]
+    T --> N[Notes par tranche<br/>petit modèle]
+    N --> V[FilingSignals<br/>validé par Pydantic]
+    V --> F[Features jour par jour<br/>sans fuite temporelle]
+    F --> X[XGBoost]
+    V -. contrôle .-> Q[XBRL officiel<br/>citations retrouvées]
+```
+
+Le document est découpé, un petit modèle prend des notes sur chaque tranche, puis le modèle d'arbitrage les
+convertit en onze variables : chiffre d'affaires et BPA du trimestre, croissance, prévisions, ton sur la
+demande, marges, risques de liquidité et juridique, retour aux actionnaires. Un communiqué publié à 16 h 30
+n'alimente le modèle qu'à partir du lendemain.
+
+`run_filings_study.py` évalue trois choses, de la plus vérifiable à la plus incertaine :
+
+1. **Coût** : appels, jetons et secondes par document.
+2. **Exactitude** : chiffre d'affaires et BPA comparés aux données XBRL de la SEC ; citations recherchées
+   mot pour mot dans le document ; nature du document comparée aux rubriques officielles du 8-K.
+3. **Utilité** : gain d'AUC hors échantillon, comparé à un témoin où chaque société reçoit les variables
+   d'une autre. Si le gain survit à l'échange, il ne venait pas du contenu des dépôts.
+
+**État actuel : essai technique sur six dépôts d'Apple, avec un modèle de 3 milliards de paramètres**
+(les modèles cibles ne tiennent pas sur la machine de développement) :
+
+| Mesure | Résultat |
+|---|---|
+| Temps de lecture | 3 minutes par document en moyenne, 18 minutes au total |
+| Chiffre d'affaires trimestriel | 3 exacts sur 4, 1 erreur d'unité |
+| BPA dilué | 2 exacts sur 4, 1 faux, 1 omis |
+| Citations retrouvées dans le texte | 75 % |
+| Communiqués de résultats reconnus comme tels | 0 sur 2 |
+| Utilité prédictive | non concluant : il faut au moins 100 dépôts lus |
+
+Ces chiffres mesurent un petit modèle sur un échantillon minuscule : ils montrent surtout que l'évaluation
+attrape les erreurs (unité, omission, mauvaise étiquette). Les variables ne sont pas branchées sur la
+stratégie tant que l'étude n'a pas tourné à grande échelle (`ENABLE_FILING_FEATURES=false`).
+
 ## Ce que les tests ont attrapé
 
-Trois défauts trouvés en exécutant réellement le système, typiques de ce genre de projet :
+Quatre défauts trouvés en exécutant réellement le système, typiques de ce genre de projet :
 
 - **Un P/E faux d'un facteur dix** sur NVDA : les prix historiques sont ajustés des divisions
   d'actions, pas les bénéfices par action publiés à l'époque. Corrigé par une table des splits.
@@ -109,10 +153,13 @@ Trois défauts trouvés en exécutant réellement le système, typiques de ce ge
   runtimes OpenMP dans le même processus).
 - **« Event loop is closed » au deuxième signal** : `asyncio.run` fermait la boucle à laquelle les
   clients HTTP des modèles restaient attachés.
+- **Des relances qui n'avaient jamais lieu** : quand un validateur Pydantic rejetait la réponse du
+  modèle, le SDK levait l'erreur avant le code de relance. Le comportement restait sûr (veto par
+  défaut), mais chaque réponse imparfaite était perdue au lieu d'être corrigée.
 
-La suite automatisée (84 tests, deux secondes, sans réseau ni LLM) couvre le verrou Pydantic, le
+La suite automatisée (123 tests, trois secondes, sans réseau ni LLM) couvre le verrou Pydantic, le
 critère de Kelly, l'absence de fuite temporelle, le moteur d'exécution, la chaîne de décision, les
-statistiques de l'expérience et le tableau de bord. Les tests anti-fuite ont été vérifiés par
+statistiques de l'expérience, le tableau de bord et la lecture des dépôts SEC. Les tests anti-fuite ont été vérifiés par
 mutation : une moyenne mobile centrée ou une purge retirée les font échouer.
 
 ## Installation
@@ -140,6 +187,15 @@ python run_experiment.py --veto-rate 0.3          # sans LLM : bras A et C seule
 python dashboard.py --run <identifiant> --open    # page de synthèse d'un backtest
 ```
 
+Lecture des dépôts SEC (les deux premières commandes sont longues et reprennent où elles s'étaient arrêtées) :
+
+```bash
+python -m data_pipeline.fetch_filings             # texte intégral des 8-K, 10-Q, 10-K
+python -m data_pipeline.fetch_news                # chiffres XBRL de référence
+python -m llm_agents.filing_extractor             # lecture par les LLM (modèles requis)
+python run_filings_study.py                       # coût, exactitude, utilité
+```
+
 ### Paper-trading en continu
 
 ```bash
@@ -163,6 +219,7 @@ quant_engine/    features, cibles par barrières, XGBoost, Kelly, optimisation O
 llm_agents/      schémas Pydantic, prompts, graphe LangGraph (comité et autopsie)
 run_backtest.py  simulation walk-forward et moteur d'exécution
 run_experiment.py  expérience contrôlée sur la valeur du veto
+run_filings_study.py  évaluation des variables extraites des dépôts SEC
 run_live.py      cycle quotidien de paper-trading
 dashboard.py     tableau de bord HTML
 tests/           suite pytest
@@ -177,14 +234,16 @@ tests/           suite pytest
 - **Exécution idéalisée** : remplissage à l'ouverture, coûts forfaitaires de 5 points de base, pas de
   liquidité ni de frais d'emprunt.
 - **Contamination des LLM en backtest**, décrite plus haut.
+- **Rapports non standard** : JPMorgan n'utilise pas les titres « Item » habituels ; son rapport de
+  gestion n'est pas isolé et seuls les 80 000 premiers caractères sont lus.
 - Données de dark pools et de flux d'options collectées mais pas évaluées dans le modèle.
 
 ## Suite prévue
 
 1. Exécuter le bras B de l'expérience avec les modèles cibles.
 2. Laisser tourner le paper-trading plusieurs mois et publier la courbe, quelle qu'elle soit.
-3. Faire lire au LLM les 8-K et 10-Q en entier pour en extraire des variables chiffrées, et tester si
-   elles améliorent le classifieur — le LLM comme source d'information plutôt que comme filtre.
+3. Lire l'ensemble des dépôts de l'univers avec les modèles cibles, puis relancer `run_filings_study.py` :
+   c'est à cette échelle que l'utilité prédictive des variables pourra être jugée.
 
 ---
 

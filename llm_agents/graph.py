@@ -93,22 +93,36 @@ def _extract_json(text: str) -> str:
     return match.group(0) if match else (text or "")
 
 
-async def structured_call(prompt: ChatPromptTemplate, variables: dict[str, Any], schema: type[T]) -> T:
+async def structured_call(prompt: ChatPromptTemplate, variables: dict[str, Any], schema: type[T],
+                          usage: Optional[dict[str, int]] = None) -> T:
     """Appelle le modèle d'arbitrage jusqu'à obtenir un objet conforme au schéma.
 
     Chaque rejet du validateur est renvoyé au modèle pour correction. Après
-    ``MAX_RETRIES`` échecs, ``StructuredOutputError`` est levée.
+    ``MAX_RETRIES`` échecs, ``StructuredOutputError`` est levée. ``usage``, s'il est fourni, cumule
+    les jetons consommés (clés ``input_tokens``, ``output_tokens``, ``calls``).
     """
     runnable = cro_llm().with_structured_output(schema, method=STRUCTURED_METHOD, include_raw=True)
     messages = prompt.format_messages(**variables)
     error = "aucune réponse"
     for attempt in range(1, MAX_RETRIES + 1):
-        result = await runnable.ainvoke(messages)
+        try:
+            result = await runnable.ainvoke(messages)
+        except ValidationError as exc:
+            # En mode json_schema, le SDK OpenAI valide lui-même la réponse et lève l'erreur avant que
+            # LangChain ne la capture : on la traite comme un rejet ordinaire, donc avec relance.
+            result = {"parsed": None, "raw": None, "validation_error": exc}
+        if usage is not None:
+            meta = getattr(result.get("raw"), "usage_metadata", None) or {}
+            usage["input_tokens"] = usage.get("input_tokens", 0) + int(meta.get("input_tokens", 0))
+            usage["output_tokens"] = usage.get("output_tokens", 0) + int(meta.get("output_tokens", 0))
+            usage["calls"] = usage.get("calls", 0) + 1
         if result.get("parsed") is not None:
             return result["parsed"]
         raw = result.get("raw")
         raw_text = raw.content if raw is not None and isinstance(raw.content, str) else ""
         try:  # seconde chance : JSON entouré de texte ou de balises
+            if result.get("validation_error") is not None:
+                raise result["validation_error"]
             return schema.model_validate_json(_extract_json(raw_text))
         except ValidationError as exc:
             error = "; ".join(f"{'.'.join(map(str, e['loc'])) or 'objet'} : {e['msg']}" for e in exc.errors())

@@ -101,3 +101,35 @@ AUTOPSY_PROMPT = ChatPromptTemplate.from_messages([
      "--- CE QUI S'EST PASSÉ PENDANT LA DÉTENTION ---\n{post_mortem}\n\n"
      "Rends ton autopsie au format JSON."),
 ])
+
+# ---------------------------------------------------------------------------
+# Lecture des dépôts SEC : le LLM comme source de variables (pas comme décideur)
+# ---------------------------------------------------------------------------
+FILING_NOTES_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "Tu es un analyste financier qui prend des notes de lecture sur un dépôt SEC. Tu relèves uniquement ce qui "
+     "est écrit dans l'extrait : aucun savoir extérieur, aucune déduction sur ce qui s'est passé ensuite."),
+    ("human",
+     "Société : {company} ({ticker}) — document : {form} déposé le {filed} — extrait {part}/{parts}\n\n"
+     "--- EXTRAIT ---\n{text}\n--- FIN DE L'EXTRAIT ---\n\n"
+     "Relève, en 10 puces maximum, les faits utiles sur : chiffre d'affaires et bénéfice par action du trimestre "
+     "(avec les montants et l'unité), croissance sur un an, prévisions de la direction, demande, marges, trésorerie "
+     "et dette, litiges ou risques nouveaux, rachats d'actions et dividendes, événement annoncé.\n"
+     "Pour chaque puce, ajoute entre guillemets la phrase EXACTE du document (en anglais) dont elle provient.\n"
+     "Si l'extrait ne contient rien d'utile, réponds uniquement : RIEN."),
+])
+
+FILING_EXTRACT_PROMPT = ChatPromptTemplate.from_messages([
+    ("system",
+     "Tu convertis un dépôt SEC en variables chiffrées pour un modèle statistique. Tu ne juges pas si l'action "
+     "va monter : tu décris ce que dit le document, et rien d'autre. Règles :\n"
+     "- un champ dont l'information est absente vaut null (montants) ou 0 (notes) : n'invente jamais un chiffre ;\n"
+     "- les montants sont ceux du TRIMESTRE, pas du semestre ni de l'exercice ; le chiffre d'affaires est en "
+     "MILLIONS de dollars ;\n"
+     "- les citations sont copiées mot pour mot depuis le document.\n"
+     "Tu réponds uniquement par l'objet JSON demandé."),
+    ("human",
+     "Société : {company} ({ticker}) — document : {form} déposé le {filed}\n\n"
+     "--- {source_label} ---\n{content}\n--- FIN ---\n\n"
+     "Rends l'objet JSON des variables extraites."),
+])

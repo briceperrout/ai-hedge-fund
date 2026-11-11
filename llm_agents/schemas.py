@@ -116,3 +116,89 @@ class AutopsyReport(BaseModel):
     @classmethod
     def _signs_bounded(cls, value: list[str]) -> list[str]:
         return [sign.strip() for sign in value if sign.strip()][:3]
+
+
+class FilingSignals(BaseModel):
+    """Variables chiffrées extraites d'un dépôt SEC (8-K, 10-Q, 10-K) par le LLM.
+
+    Le LLM est ici une source d'information : il transforme un texte long en quelques nombres
+    que XGBoost peut exploiter. Les deux premiers champs chiffrés sont vérifiables contre les
+    données XBRL officielles, et chaque citation contre le texte source.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    event_type: Literal[
+        "EARNINGS", "GUIDANCE_UPDATE", "M_AND_A", "MANAGEMENT_CHANGE", "FINANCING", "LEGAL_REGULATORY",
+        "RESTRUCTURING", "SHAREHOLDER_RETURN", "OTHER",
+    ] = Field(description="Nature principale du document. EARNINGS pour une publication de résultats ou un rapport périodique.")
+    revenue_musd: Optional[float] = Field(
+        description="Chiffre d'affaires du TRIMESTRE publié, en MILLIONS de dollars (ex. 117154 pour 117,154 milliards). "
+                    "null si le document ne le donne pas.")
+    eps_diluted: Optional[float] = Field(
+        description="Bénéfice par action dilué du TRIMESTRE publié, en dollars (ex. 1.88). null s'il est absent.")
+    revenue_growth_yoy_pct: Optional[float] = Field(
+        description="Variation du chiffre d'affaires trimestriel sur un an, en pourcentage (ex. -5.5). null si absente.")
+    guidance_direction: int = Field(
+        description="Prévisions de la direction : 1 relevées ou optimistes, -1 abaissées ou prudentes, 0 inchangées ou absentes.")
+    demand_tone: int = Field(
+        description="Ton sur la demande et l'activité, de -2 (forte dégradation) à 2 (forte amélioration), 0 si neutre ou sans objet.")
+    margin_trend: int = Field(description="Marges : 1 en hausse, -1 en baisse, 0 stables ou non mentionnées.")
+    liquidity_risk: int = Field(
+        description="Tension sur la trésorerie ou la dette, de 0 (aucune) à 3 (risque de continuité d'exploitation).")
+    legal_risk: int = Field(
+        description="Litiges et risque réglementaire NOUVEAUX ou aggravés, de 0 (rien de notable) à 3 (menace majeure).")
+    shareholder_return: int = Field(
+        description="Rachats d'actions et dividendes : 1 annonce ou hausse, -1 suspension ou baisse, 0 inchangé ou non mentionné.")
+    evidence: list[str] = Field(
+        description="1 à 3 citations EXACTES du document (copiées mot pour mot, en anglais, 25 mots maximum chacune) "
+                    "qui justifient les notes ci-dessus.")
+    summary: str = Field(description="L'essentiel du document en une phrase.")
+
+    @field_validator("guidance_direction", "margin_trend", "shareholder_return")
+    @classmethod
+    def _direction(cls, value: int) -> int:
+        if value not in (-1, 0, 1):
+            raise ValueError("doit valoir -1, 0 ou 1")
+        return value
+
+    @field_validator("demand_tone")
+    @classmethod
+    def _tone(cls, value: int) -> int:
+        if not -2 <= value <= 2:
+            raise ValueError("doit être compris entre -2 et 2")
+        return value
+
+    @field_validator("liquidity_risk", "legal_risk")
+    @classmethod
+    def _risk(cls, value: int) -> int:
+        if not 0 <= value <= 3:
+            raise ValueError("doit être compris entre 0 et 3")
+        return value
+
+    @field_validator("revenue_musd")
+    @classmethod
+    def _revenue_positive(cls, value: Optional[float]) -> Optional[float]:
+        if value == 0:  # « 0 » est la façon dont les petits modèles écrivent « absent »
+            return None
+        if value is not None and value <= 0:
+            raise ValueError("un chiffre d'affaires est strictement positif (null s'il est absent)")
+        if value is not None and value > 2_000_000:  # aucune société ne réalise 2 000 milliards par trimestre
+            raise ValueError("valeur invraisemblable : le chiffre d'affaires doit être exprimé en MILLIONS de dollars "
+                             "(117154 pour 117,154 milliards), pas en dollars")
+        return value
+
+    @field_validator("eps_diluted")
+    @classmethod
+    def _eps_plausible(cls, value: Optional[float]) -> Optional[float]:
+        if value is not None and abs(value) > 1_000:
+            raise ValueError("valeur invraisemblable : le bénéfice par action s'exprime en dollars par action (ex. 1.88)")
+        return value
+
+    @field_validator("evidence")
+    @classmethod
+    def _evidence_present(cls, value: list[str]) -> list[str]:
+        quotes = [quote.strip().strip('"“”') for quote in value if quote.strip()][:3]
+        if not quotes:
+            raise ValueError("au moins une citation exacte du document est exigée")
+        return quotes

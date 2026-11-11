@@ -155,3 +155,40 @@ def test_llm_cannot_create_an_order_without_a_statistical_signal(monkeypatch):
 def test_extract_json_strips_surrounding_text():
     assert graph._extract_json('Voici ma réponse :\n```json\n{"a": 1}\n```') == '{"a": 1}'
     assert graph._extract_json("pas de json") == "pas de json"
+
+
+class FakeStructuredLLM:
+    """Imite le SDK OpenAI en mode json_schema : il lève lui-même l'erreur de validation."""
+
+    def __init__(self, payloads: list[dict]):
+        self.payloads, self.seen = list(payloads), []
+
+    def with_structured_output(self, schema, **kwargs):
+        self.schema = schema
+        return self
+
+    async def ainvoke(self, messages):
+        self.seen.append(messages)
+        return {"parsed": self.schema.model_validate(self.payloads.pop(0)), "raw": None}
+
+
+def test_validator_rejection_inside_the_sdk_still_triggers_a_retry(monkeypatch):
+    good = verdict()["decision"].model_dump()
+    fake = FakeStructuredLLM([{**good, "final_action": "HOLD"}, good])       # 1re réponse incohérente
+    monkeypatch.setattr(graph, "cro_llm", lambda: fake)
+    usage: dict = {}
+    decision = graph._run_async(graph.structured_call(graph.CRO_PROMPT, {
+        "ticker": "A", "as_of": "2023-03-10", "trigger": "", "technical": "", "fundamental": "", "macro": "",
+        "news": "", "win_probability": 0.8, "stat_action": "BUY", "experience": "", "bull": "", "bear": ""},
+        VetoDecision, usage=usage))
+    assert decision.final_action == "BUY" and usage["calls"] == 2
+    assert "REJETÉE" in fake.seen[1][-1].content                             # l'erreur est renvoyée au modèle
+
+
+def test_structured_call_gives_up_after_max_retries(monkeypatch):
+    bad = {**verdict()["decision"].model_dump(), "final_action": "HOLD"}
+    monkeypatch.setattr(graph, "cro_llm", lambda: FakeStructuredLLM([bad] * graph.MAX_RETRIES))
+    with pytest.raises(graph.StructuredOutputError):
+        graph._run_async(graph.structured_call(graph.CRO_PROMPT, {
+            "ticker": "A", "as_of": "", "trigger": "", "technical": "", "fundamental": "", "macro": "", "news": "",
+            "win_probability": 0.8, "stat_action": "BUY", "experience": "", "bull": "", "bear": ""}, VetoDecision))
