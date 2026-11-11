@@ -48,6 +48,7 @@ load_dotenv(ROOT / ".env")
 log = logging.getLogger("live")
 
 STATE_PATH = ROOT / "data" / "live_state.json"
+DECISIONS_PATH = ROOT / "data" / "live_decisions.jsonl"
 MARKET_TZ = "America/New_York"
 RETRAIN_AFTER_DAYS = int(os.getenv("LIVE_RETRAIN_DAYS", "7"))
 
@@ -160,6 +161,25 @@ def save_state(state: dict[str, Any]) -> None:
     STATE_PATH.write_text(json.dumps(state, indent=2, ensure_ascii=False, default=str))
 
 
+def log_decisions(decisions: list[dict[str, Any]]) -> None:
+    """Archive chaque signal et le verdict du comité : c'est la matière du tableau de bord
+    et de la mesure, en conditions réelles, de la valeur du veto."""
+    if not decisions:
+        return
+    with DECISIONS_PATH.open("a", encoding="utf-8") as fh:
+        for decision in decisions:
+            fh.write(json.dumps(decision, ensure_ascii=False, default=str) + "\n")
+
+
+def refresh_dashboard() -> None:
+    try:
+        from dashboard import build_dashboard
+
+        print(f"  Tableau de bord : {build_dashboard()}")
+    except Exception:  # le tableau de bord ne doit jamais faire échouer un cycle de trading
+        log.exception("Tableau de bord non régénéré.")
+
+
 def committee_ready() -> bool:
     from llm_agents.graph import check_llm_services
 
@@ -221,6 +241,7 @@ def cycle_paper(tickers: list[str], cfg: StrategyConfig, dry_run: bool, allow_in
         print("  (--dry-run : rien n'a été enregistré)")
         return
     save_state({**load_state(), "paper": {"last_day": today.strftime(ISO), "engine": engine.to_state()}})
+    log_decisions(decisions)
     if ready and closed:
         night_autopsy(closed, prices, macro, mode="live", scope="live", use_memory=True)
 
@@ -307,6 +328,7 @@ def cycle_alpaca(tickers: list[str], cfg: StrategyConfig, dry_run: bool, allow_i
         print("  (--dry-run : aucun ordre envoyé, rien n'a été enregistré)")
         return
     save_state({**state, "alpaca": book})
+    log_decisions(decisions)
     if ready and closed:
         night_autopsy(closed, prices, macro, mode="live", scope="live", use_memory=True)
 
@@ -355,6 +377,8 @@ def run_cycle(args: argparse.Namespace) -> None:
     broker = os.getenv("BROKER", "paper").lower()
     cycle = cycle_alpaca if broker == "alpaca" else cycle_paper
     cycle(tickers, cfg, args.dry_run, args.allow_intraday)
+    if not args.dry_run and broker != "alpaca":
+        refresh_dashboard()
 
 
 def main() -> None:
