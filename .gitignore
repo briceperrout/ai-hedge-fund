@@ -1,0 +1,20 @@
+# Secrets et configuration locale
+.env
+
+# Données, modèles et rapports générés (reconstruits par les scripts)
+data/
+
+# Environnement Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Système / éditeurs
+.DS_Store
+.idea/
+.vscode/
+.claude/

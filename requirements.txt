@@ -1,0 +1,18 @@
+# Dépendances figées (Python 3.12) — générées depuis le venv du projet
+pandas==3.0.5
+numpy==2.5.3
+xgboost==3.4.1
+scikit-learn==1.9.0
+optuna==5.0.0
+yfinance==1.7.0
+feedparser==6.0.14
+requests==2.34.2
+langchain==1.4.0
+langchain-core==1.7.7
+langchain-ollama==1.1.0
+langchain-openai==1.7.4
+langgraph==1.2.11
+pydantic==2.13.5
+qdrant-client==1.19.0
+sentence-transformers==6.0.1
+python-dotenv==1.2.3
