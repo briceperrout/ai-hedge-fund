@@ -14,6 +14,7 @@ Brokers (variable BROKER du .env) :
 Usage :
     python run_live.py                 # un cycle
     python run_live.py --dry-run       # analyse sans rien enregistrer ni envoyer
+    python run_live.py --quant-only    # portefeuille témoin seul (aucun modèle LLM requis)
     python run_live.py --loop --at 16:30   # un cycle par jour ouvré (heure de New York)
     python run_live.py --autopsy       # autopsie seule ; --status : état du portefeuille
 """
@@ -194,19 +195,32 @@ def committee_ready() -> bool:
 # ---------------------------------------------------------------------------
 # Cycles
 # ---------------------------------------------------------------------------
-def cycle_paper(tickers: list[str], cfg: StrategyConfig, dry_run: bool, allow_intraday: bool) -> None:
+QUANT_BOOK = "paper_quant"      # portefeuille témoin : tout signal est exécuté, sans comité
+BOOK_LABELS = {"paper": "avec comité IA", QUANT_BOOK: "quantitatif seul"}
+
+
+def cycle_paper(tickers: list[str], cfg: StrategyConfig, dry_run: bool, allow_intraday: bool, *,
+                book: str = "paper", use_llm: bool = True) -> None:
+    """Un cycle du simulateur local pour le portefeuille ``book``.
+
+    Deux portefeuilles vivent côte à côte sur les mêmes signaux : ``paper`` (veto du CRO) et
+    ``paper_quant`` (aucun filtre). Leur écart, mesuré en temps réel, est la seule évaluation du
+    comité qui échappe au biais de contamination des backtests.
+    """
+    label = BOOK_LABELS[book]
     dataset, prices, features = build_dataset(tickers, cfg)
     dataset = completed_sessions(dataset, allow_intraday)
     macro = load_macro()
     today = dataset.index.max()
     macro = macro.loc[:today]
 
-    state = load_state().get("paper")
+    state = load_state().get(book)
+    run_id = "live-paper" if use_llm else "live-quant"
     engine = (ExecutionEngine.from_state(state["engine"], cfg, "live") if state
-              else ExecutionEngine(cfg, float(os.getenv("INITIAL_CAPITAL", "100000")), "live-paper", "live"))
+              else ExecutionEngine(cfg, float(os.getenv("INITIAL_CAPITAL", "100000")), run_id, "live"))
     last_done = pd.Timestamp(state["last_day"]) if state else None
     if last_done is not None and last_done >= today:
-        print(f"Séance du {today.date()} déjà traitée. Capital : {engine.equity():,.2f} USD.")
+        print(f"[{label}] Séance du {today.date()} déjà traitée. Capital : {engine.equity():,.2f} USD.")
         return
     sessions = dataset.index.unique().sort_values()
     todo = [today] if last_done is None else [d for d in sessions if d > last_done]
@@ -219,19 +233,19 @@ def cycle_paper(tickers: list[str], cfg: StrategyConfig, dry_run: bool, allow_in
         equity = engine.mark(day, bars)
 
     decisions: list[dict[str, Any]] = []
-    ready = committee_ready()
+    ready = committee_ready() if use_llm else True
     if ready:
         model = ensure_model(dataset, features, today)
         approved, systemic = evaluate_signals(
             today, by_day[today], model, features, cfg, prices=prices, macro=macro,
             held=set(engine.positions) | set(engine.pending), cooldown=engine.cooldown, equity=equity,
             cash=engine.buying_power(), slots=engine.free_slots(), mode="live", scope=None,
-            use_llm=True, use_memory=True, decisions=decisions)
+            use_llm=use_llm, use_memory=use_llm, decisions=decisions, with_dossier=use_llm)
         for order in approved:
             engine.pending[order.plan.ticker] = order
         engine.emergency_exit = systemic
 
-    print(f"\nCycle du {today.date()} — capital {equity:,.2f} USD, liquidités {engine.cash:,.2f} USD")
+    print(f"\n[{label}] Cycle du {today.date()} — capital {equity:,.2f} USD, liquidités {engine.cash:,.2f} USD")
     print(f"  Positions : {', '.join(f'{t} x{p.shares}' for t, p in engine.positions.items()) or 'aucune'}")
     print(f"  Trades clôturés : {len(closed)} | signaux XGBoost : {len(decisions)} | "
           f"ordres pour la prochaine ouverture : {', '.join(engine.pending) or 'aucun'}")
@@ -240,7 +254,9 @@ def cycle_paper(tickers: list[str], cfg: StrategyConfig, dry_run: bool, allow_in
     if dry_run:
         print("  (--dry-run : rien n'a été enregistré)")
         return
-    save_state({**load_state(), "paper": {"last_day": today.strftime(ISO), "engine": engine.to_state()}})
+    save_state({**load_state(), book: {"last_day": today.strftime(ISO), "engine": engine.to_state()}})
+    if not use_llm:
+        return
     log_decisions(decisions)
     if ready and closed:
         night_autopsy(closed, prices, macro, mode="live", scope="live", use_memory=True)
@@ -336,7 +352,8 @@ def cycle_alpaca(tickers: list[str], cfg: StrategyConfig, dry_run: bool, allow_i
 def autopsy_backlog(tickers: list[str], cfg: StrategyConfig) -> None:
     """Rattrape les autopsies des trades live perdants jamais analysés."""
     with db_connect() as con:
-        rows = con.execute("SELECT * FROM trades WHERE mode = 'live' AND pnl < 0 AND autopsy_done = 0").fetchall()
+        rows = con.execute("SELECT * FROM trades WHERE mode = 'live' AND run_id != 'live-quant' AND pnl < 0 "
+                           "AND autopsy_done = 0").fetchall()
     if not rows:
         print("Aucun trade perdant en attente d'autopsie.")
         return
@@ -350,11 +367,13 @@ def autopsy_backlog(tickers: list[str], cfg: StrategyConfig) -> None:
 
 def show_status() -> None:
     state = load_state()
-    if "paper" in state:
-        eng = state["paper"]["engine"]
+    for book in ("paper", QUANT_BOOK):
+        if book not in state:
+            continue
+        eng = state[book]["engine"]
         value = eng["cash"] + sum(p["shares"] * eng["last_price"].get(t, p["entry_price"])
                                   for t, p in eng["positions"].items())
-        print(f"[paper] dernière séance traitée : {state['paper']['last_day']} | capital {value:,.2f} USD "
+        print(f"[{BOOK_LABELS[book]}] dernière séance traitée : {state[book]['last_day']} | capital {value:,.2f} USD "
               f"(départ {eng['initial_capital']:,.0f}) | liquidités {eng['cash']:,.2f}")
         for ticker, pos in eng["positions"].items():
             print(f"  {ticker:<6} x{pos['shares']} entrée {pos['entry_price']:.2f} le {pos['entry_date']} | "
@@ -375,9 +394,12 @@ def run_cycle(args: argparse.Namespace) -> None:
     tickers = [t.upper() for t in args.tickers]
     refresh_data(tickers, with_news=not args.no_news)
     broker = os.getenv("BROKER", "paper").lower()
-    cycle = cycle_alpaca if broker == "alpaca" else cycle_paper
-    cycle(tickers, cfg, args.dry_run, args.allow_intraday)
-    if not args.dry_run and broker != "alpaca":
+    if not args.quant_only:
+        cycle = cycle_alpaca if broker == "alpaca" else cycle_paper
+        cycle(tickers, cfg, args.dry_run, args.allow_intraday)
+    if not args.no_shadow:  # portefeuille témoin, toujours en simulateur local
+        cycle_paper(tickers, cfg, args.dry_run, args.allow_intraday, book=QUANT_BOOK, use_llm=False)
+    if not args.dry_run:
         refresh_dashboard()
 
 
@@ -387,6 +409,9 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true", help="Analyse sans enregistrer ni envoyer d'ordre.")
     parser.add_argument("--no-news", action="store_true", help="Ne pas rafraîchir les flux RSS / SEC.")
     parser.add_argument("--allow-intraday", action="store_true", help="Utiliser la bougie du jour même avant la clôture.")
+    parser.add_argument("--quant-only", action="store_true",
+                        help="Ne faire tourner que le portefeuille témoin (machine sans modèles LLM).")
+    parser.add_argument("--no-shadow", action="store_true", help="Ne pas tenir le portefeuille témoin quantitatif seul.")
     parser.add_argument("--loop", action="store_true", help="Un cycle par jour ouvré, indéfiniment.")
     parser.add_argument("--at", default="16:30", help="Heure du cycle en mode --loop (heure de New York).")
     parser.add_argument("--autopsy", action="store_true", help="Lancer uniquement l'autopsie des pertes en attente.")

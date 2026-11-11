@@ -4,8 +4,8 @@ Un modèle statistique propose des trades, un comité de LLM locaux a le droit d
 et du code Python déterministe garde seul la main sur l'argent.
 
 Ce dépôt est un **projet de recherche et d'apprentissage**. Il ne passe aucun ordre réel, ne promet
-aucune performance, et sa conclusion provisoire est honnête : sur la période testée, le signal ne bat
-pas le marché. L'intérêt est dans la méthode — comment construire un tel système sans qu'il triche,
+aucune performance, et sa conclusion provisoire est honnête : testé sur huit ans, le signal ne bat pas le
+marché et ne choisit pas mieux que le hasard. L'intérêt est dans la méthode — comment construire un tel système sans qu'il triche,
 et comment mesurer ce que les LLM y apportent vraiment.
 
 ## La question posée
@@ -65,11 +65,44 @@ Tout tourne en local : Ollama et LM Studio pour les modèles, Qdrant pour les ve
 
 Lecture : la stratégie est investie une petite fraction du temps (Kelly au quart, dix valeurs), d'où
 une courbe presque plate. Le Sharpe est flatteur mais repose sur 24 trades ; l'AUC du classifieur en
-validation est proche de 0,5, autrement dit **l'avantage statistique n'est pas démontré**. Les
+validation est proche de 0,5. **Le test élargi ci-dessous montre que ce résultat ne tient pas.** Les
 hyperparamètres ont été choisis par Optuna sur des données antérieures à 2023.
 
 Les chiffres varient légèrement d'un jour à l'autre (un trade de plus ou de moins) parce que Yahoo
 recalcule les prix ajustés ; à données identiques, le backtest est déterministe.
+
+### Robustesse : huit ans, cinquante valeurs, et une référence aléatoire
+
+L'année 2023 était une fenêtre favorable. `run_robustness.py` rejoue le moteur quantitatif de 2019 à
+novembre 2026, sur l'univers d'origine puis sur quarante grandes valeurs qu'Optuna n'a jamais vues.
+
+| | Univers d'origine (10) | Valeurs jamais vues (40) | S&P 500 |
+|---|---|---|---|
+| Rendement sur la période | +2,4 % | +15,5 % | +236 % |
+| Ratio de Sharpe | 0,08 | 0,27 | — |
+| Perte maximale | −21,1 % | −20,2 % | — |
+| Trades | 339 | 247 | — |
+
+Un taux de réussite élevé ne prouve rien ici : avec un objectif à 1,5 ATR et un stop à 3 ATR, une
+entrée au hasard gagne déjà une fois sur deux. La vraie question est de savoir si les signaux font
+mieux que le hasard, et pourquoi.
+
+| | Univers d'origine | Valeurs jamais vues |
+|---|---|---|
+| Rendement moyen par signal | +0,77 % | +1,89 % |
+| Rendement moyen d'une entrée au hasard, mêmes années | +0,98 % | +0,59 % |
+| Jours à signal : rendement moyen de tout l'univers | +0,80 % | +0,99 % |
+| Autres jours : rendement moyen de tout l'univers | +0,66 % | +0,42 % |
+| Écart entre la valeur désignée et la moyenne du jour | +0,06 % (t = 0,19) | −0,17 % (t = −0,67) |
+
+**Conclusion : le modèle ne sait pas choisir une action.** Les jours où il émet un signal, la valeur
+qu'il désigne ne fait pas mieux que la moyenne de l'univers. L'écart apparent sur les quarante valeurs
+vient du calendrier : les signaux se concentrent sur les périodes de forte volatilité (984 en 2020,
+495 en 2022), où tout acheter après une chute rapportait davantage. C'est un effet « acheter le creux »,
+porté par un petit nombre d'épisodes de marché, pas une capacité de sélection.
+
+Les t de Student sont calculés sur des blocs de dix séances, parce que les trades se chevauchent.
+Biais restants : univers choisi aujourd'hui, exécution idéalisée.
 
 ### Valeur du veto : l'expérience contrôlée
 
@@ -157,7 +190,7 @@ Quatre défauts trouvés en exécutant réellement le système, typiques de ce g
   modèle, le SDK levait l'erreur avant le code de relance. Le comportement restait sûr (veto par
   défaut), mais chaque réponse imparfaite était perdue au lieu d'être corrigée.
 
-La suite automatisée (123 tests, trois secondes, sans réseau ni LLM) couvre le verrou Pydantic, le
+La suite automatisée (134 tests, trois secondes, sans réseau ni LLM) couvre le verrou Pydantic, le
 critère de Kelly, l'absence de fuite temporelle, le moteur d'exécution, la chaîne de décision, les
 statistiques de l'expérience, le tableau de bord et la lecture des dépôts SEC. Les tests anti-fuite ont été vérifiés par
 mutation : une moyenne mobile centrée ou une purge retirée les font échouer.
@@ -184,6 +217,7 @@ python run_backtest.py --no-llm                   # moteur quantitatif seul, 202
 python run_backtest.py                            # système complet (modèles requis)
 python run_experiment.py                          # les trois bras + verdict statistique
 python run_experiment.py --veto-rate 0.3          # sans LLM : bras A et C seulement
+python run_robustness.py                          # 2019 à aujourd'hui, deux univers, référence aléatoire
 python dashboard.py --run <identifiant> --open    # page de synthèse d'un backtest
 ```
 
@@ -200,12 +234,15 @@ python run_filings_study.py                       # coût, exactitude, utilité
 
 ```bash
 python run_live.py --loop --at 16:30    # un cycle par jour ouvré, après la clôture de New York
-python run_live.py --status             # état du portefeuille
+python run_live.py --quant-only         # machine sans modèles : portefeuille témoin seul
+python run_live.py --status             # état des portefeuilles
 python dashboard.py --open              # tableau de bord (data/dashboard.html)
 ```
 
-Chaque cycle met à jour les données, gère les positions, soumet les nouveaux signaux au comité,
-autopsie les pertes, puis régénère `data/dashboard.html`. Pour que la boucle survive à la fermeture
+Deux portefeuilles simulés vivent côte à côte sur les mêmes signaux : l'un soumis au veto du CRO,
+l'autre qui exécute tout (témoin). Leur écart, mesuré en temps réel, est la seule évaluation du comité
+qui échappe au biais de contamination. Chaque cycle met à jour les données, gère les positions, soumet
+les nouveaux signaux au comité, autopsie les pertes, puis régénère `data/dashboard.html`. Pour que la boucle survive à la fermeture
 du terminal : `tmux`, ou `nohup python run_live.py --loop > live.log 2>&1 &`.
 
 Le broker par défaut est un simulateur local qui partage son moteur d'exécution avec le backtest.
@@ -220,6 +257,7 @@ llm_agents/      schémas Pydantic, prompts, graphe LangGraph (comité et autops
 run_backtest.py  simulation walk-forward et moteur d'exécution
 run_experiment.py  expérience contrôlée sur la valeur du veto
 run_filings_study.py  évaluation des variables extraites des dépôts SEC
+run_robustness.py  robustesse du signal dans le temps et sur d'autres valeurs
 run_live.py      cycle quotidien de paper-trading
 dashboard.py     tableau de bord HTML
 tests/           suite pytest
@@ -227,7 +265,8 @@ tests/           suite pytest
 
 ## Limites connues
 
-- **Signal non prouvé** : dix grandes capitalisations, une seule année de test, peu de trades.
+- **Pas d'avantage de sélection** : testé sur huit ans et cinquante valeurs, le signal ne désigne pas de
+  meilleures actions que le hasard (voir Robustesse).
 - **Biais du survivant** : l'univers est choisi aujourd'hui, avec des valeurs qui ont bien tourné.
 - **Dépêches historiques incomplètes** : la recherche datée de Google News ne restitue pas ce qui
   était réellement lisible le jour même.

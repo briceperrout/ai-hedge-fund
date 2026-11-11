@@ -34,22 +34,39 @@ OUTCOME_LABELS = {"APPROVED": "Autorisé", "VETO": "Veto", "ERROR": "Bloqué (co
 # ---------------------------------------------------------------------------
 # Chargement
 # ---------------------------------------------------------------------------
+BOOKS = {"paper": ("Avec comité IA", "live-paper"), "paper_quant": ("Quantitatif seul", "live-quant")}
+
+
+def _curve(engine: dict[str, Any]) -> pd.Series:
+    return pd.Series({pd.Timestamp(d): float(v) for d, v in engine.get("equity_curve", [])}, dtype=float)
+
+
 def load_live() -> dict[str, Any]:
+    """Portefeuille principal (celui du comité s'il existe, sinon le témoin) et, le cas échéant, l'autre."""
     state_path = DATA / "live_state.json"
-    state = json.loads(state_path.read_text()).get("paper") if state_path.exists() else None
-    engine = state["engine"] if state else {}
+    state = json.loads(state_path.read_text()) if state_path.exists() else {}
+    books = [key for key in BOOKS if key in state]
+    main = books[0] if books else "paper"
+    engine = state.get(main, {}).get("engine", {})
+    label, run_id = BOOKS[main]
     with db_connect() as con:
         trades = pd.read_sql_query("SELECT * FROM trades WHERE mode = 'live' ORDER BY exit_date, id", con)
     decisions_path = DATA / "live_decisions.jsonl"
     decisions = (pd.DataFrame([json.loads(line) for line in decisions_path.read_text().splitlines() if line.strip()])
                  if decisions_path.exists() else pd.DataFrame())
+    others = []
+    for key in books[1:]:
+        other = state[key]["engine"]
+        others.append({"label": BOOKS[key][0], "curve": _curve(other), "initial": float(other["initial_capital"]),
+                       "trades": trades[trades["run_id"] == BOOKS[key][1]]})
     return {
-        "title": "Paper-trading en continu", "subtitle": "Portefeuille simulé, argent fictif",
+        "title": "Paper-trading en continu", "subtitle": f"Portefeuille simulé, argent fictif — {label.lower()}",
+        "label": label, "others": others,
         "initial": float(engine.get("initial_capital", 0.0)), "cash": float(engine.get("cash", 0.0)),
-        "curve": pd.Series({pd.Timestamp(d): float(v) for d, v in engine.get("equity_curve", [])}, dtype=float),
+        "curve": _curve(engine),
         "positions": engine.get("positions", {}), "pending": engine.get("pending", {}),
         "last_price": engine.get("last_price", {}), "emergency": bool(engine.get("emergency_exit", False)),
-        "trades": trades, "decisions": decisions,
+        "trades": trades[trades["run_id"] == run_id], "decisions": decisions,
     }
 
 
@@ -147,19 +164,23 @@ def nice_ticks(low: float, high: float, count: int = 4) -> list[float]:
     return [float(t) for t in np.arange(start, high + step * 0.01, step)]
 
 
-def equity_chart(curve: pd.Series) -> str:
-    """Portefeuille et S&P 500, tous deux en base 100 au premier jour (un seul axe)."""
+def equity_chart(curve: pd.Series, label: str = "Portefeuille", others: Optional[list[dict[str, Any]]] = None) -> str:
+    """Portefeuille(s) et S&P 500, en base 100 à leur premier jour affiché (un seul axe)."""
     if len(curve) < 2:
         return '<p class="empty">La courbe apparaîtra après deux séances traitées.</p>'
     portfolio = curve / curve.iloc[0] * 100
     spy = load_macro().get("spy", pd.Series(dtype=float)).reindex(curve.index).ffill().bfill()
-    series = [("Portefeuille", "s1", portfolio)]
+    series = [(label, "s1", portfolio)]
+    for other in (others or [])[:1]:
+        aligned = other["curve"].reindex(curve.index)
+        if aligned.notna().sum() >= 2:
+            series.append((other["label"], "s3", aligned / aligned.dropna().iloc[0] * 100))
     if spy.notna().all() and len(spy):
         series.append(("S&P 500", "s2", spy / spy.iloc[0] * 100))
 
     width, height, left, right, top, bottom = 800, 300, 44, 96, 14, 28
     lo = min(s.min() for _, _, s in series)
-    hi = max(s.max() for _, _, s in series)
+    hi = max(s.max() for _, _, s in series)  # min/max ignorent les valeurs manquantes
     pad = max((hi - lo) * 0.08, 0.5)
     lo, hi = lo - pad, hi + pad
     n = len(curve)
@@ -181,9 +202,10 @@ def equity_chart(curve: pd.Series) -> str:
 
     ends = []
     for name, cls, values in series:
-        points = " ".join(f"{x(i):.1f},{y(v):.1f}" for i, v in enumerate(values))
+        points = " ".join(f"{x(i):.1f},{y(v):.1f}" for i, v in enumerate(values) if pd.notna(v))
         parts.append(f'<polyline class="line {cls}" points="{points}"/>')
-        ends.append([name, cls, float(values.iloc[-1]), y(values.iloc[-1])])
+        last_value = float(values.dropna().iloc[-1])
+        ends.append([name, cls, last_value, y(last_value)])
     ends.sort(key=lambda e: e[3])
     for a, b in zip(ends, ends[1:]):  # écarte les étiquettes de fin de courbe qui se chevauchent
         if b[3] - a[3] < 30:
@@ -200,12 +222,15 @@ def equity_chart(curve: pd.Series) -> str:
                  f'height="{height - top - bottom}" fill="transparent"/></svg>')
 
     payload = {"dates": [d.strftime("%d/%m/%Y") for d in curve.index],
-               "series": [{"name": name, "cls": cls, "values": [round(float(v), 2) for v in values],
-                           "y": [round(y(v), 1) for v in values]} for name, cls, values in series],
+               "series": [{"name": name, "cls": cls,
+                           "values": [round(float(v), 2) if pd.notna(v) else None for v in values],
+                           "y": [round(y(v), 1) if pd.notna(v) else None for v in values]}
+                          for name, cls, values in series],
                "x": [round(x(i), 1) for i in range(n)], "width": width}
     legend = "".join(f'<span><i class="swatch {cls}"></i>{esc(name)}</span>' for name, cls, _ in series)
     table = "".join(
-        f"<tr><td>{d:%d/%m/%Y}</td>" + "".join(f'<td class="num">{s.iloc[i]:.1f}</td>' for _, _, s in series) + "</tr>"
+        f"<tr><td>{d:%d/%m/%Y}</td>" + "".join(f'<td class="num">{s.iloc[i]:.1f}</td>' if pd.notna(s.iloc[i]) else '<td class="num">—</td>'
+                                         for _, _, s in series) + "</tr>"
         for i, d in list(enumerate(curve.index))[-30:][::-1])
     head = "".join(f'<th class="num">{esc(name)}</th>' for name, _, _ in series)
     return (f'<div class="legend">{legend}</div><div class="chartwrap">{"".join(parts)}<div id="tip" hidden></div></div>'
@@ -275,13 +300,28 @@ def render(data: dict[str, Any]) -> str:
     else:
         veto_html = '<p class="empty">Aucun signal soumis au comité pour l\'instant.</p>'
 
+    compare_html = ""
+    if data.get("others"):
+        rows = []
+        for name, book in [(data.get("label", "Portefeuille"), data)] + [(o["label"], o) for o in data["others"]]:
+            k = compute_kpis({"curve": book["curve"], "trades": book["trades"], "initial": book["initial"]})
+            rows.append([esc(name), usd(k["equity"]) if "equity" in k else "n/d", pct(k.get("total_return")),
+                         pct(k.get("max_drawdown")), str(k["trades"]),
+                         f"{k['win_rate']:.0%}" if "win_rate" in k else "n/d"])
+        compare_html = ("<section><h2>Comité IA contre quantitatif seul, sur les mêmes signaux</h2>"
+                        + table([("Portefeuille", False), ("Capital", True), ("Rendement", True), ("Perte maximale", True),
+                                 ("Trades", True), ("Gagnants", True)], rows, "")
+                        + '<p class="hint">Le comité ne peut que bloquer des trades : son apport se lit dans l\'écart '
+                          "entre ces deux lignes, mesuré en temps réel.</p></section>")
+
     period = (f"du {kpis['start']:%d/%m/%Y} au {kpis['end']:%d/%m/%Y}" if "start" in kpis
               else "aucune séance traitée pour l'instant")
     alert = ('<p class="alert">⚠ Alerte systémique du CRO : toutes les positions seront coupées à la prochaine ouverture.</p>'
              if data["emergency"] else "")
     return PAGE.format(
         title=esc(data["title"]), subtitle=esc(data["subtitle"]), period=period, alert=alert, tiles=tiles_html,
-        chart=equity_chart(data["curve"]),
+        chart=equity_chart(data["curve"], data.get("label", "Portefeuille"), data.get("others")),
+        compare=compare_html,
         positions=table([("Valeur", False), ("Actions", True), ("Entrée", True), ("Dernier", True), ("Latent", True),
                          ("Stop", True), ("Objectif", True), ("Depuis", False)], positions, "Aucune position ouverte."),
         pending=f"<p>Ordres pour la prochaine ouverture : {pending}</p>" if pending else "",
@@ -299,9 +339,9 @@ PAGE = """<!doctype html>
 <title>{title}</title>
 <style>
 :root {{ color-scheme: light; --page:#f4f3f0; --surface:#fcfcfb; --border:#e3e1da; --text:#0b0b0b; --text2:#52514e;
-  --muted:#85837c; --grid:#e9e7e1; --s1:#2a78d6; --s2:#eb6834; }}
+  --muted:#85837c; --grid:#e9e7e1; --s1:#2a78d6; --s2:#eb6834; --s3:#1baf7a; }}
 @media (prefers-color-scheme: dark) {{ :root {{ color-scheme: dark; --page:#111110; --surface:#1a1a19; --border:#33322f;
-  --text:#f0efec; --text2:#c3c2b7; --muted:#8f8d85; --grid:#2a2927; --s1:#3987e5; --s2:#d95926; }} }}
+  --text:#f0efec; --text2:#c3c2b7; --muted:#8f8d85; --grid:#2a2927; --s1:#3987e5; --s2:#d95926; --s3:#199e70; }} }}
 * {{ box-sizing: border-box; }}
 body {{ margin:0; background:var(--page); color:var(--text); font:15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }}
 main {{ max-width:1040px; margin:0 auto; padding:28px 16px 48px; }}
@@ -317,14 +357,14 @@ section {{ margin-top:12px; }}
 .hint, .empty, footer {{ color:var(--muted); font-size:13px; }}
 .legend {{ display:flex; gap:16px; font-size:13px; color:var(--text2); margin-bottom:4px; }}
 .swatch {{ display:inline-block; width:14px; height:2px; vertical-align:middle; margin-right:6px; }}
-.swatch.s1 {{ background:var(--s1); }} .swatch.s2 {{ background:var(--s2); }}
+.swatch.s1 {{ background:var(--s1); }} .swatch.s2 {{ background:var(--s2); }} .swatch.s3 {{ background:var(--s3); }}
 .chartwrap {{ position:relative; }}
 svg {{ width:100%; height:auto; display:block; }}
 .grid {{ stroke:var(--grid); stroke-width:1; }} .base {{ stroke:var(--muted); stroke-width:1; stroke-dasharray:3 3; }}
 .axis {{ fill:var(--muted); font-size:11px; }}
 .line {{ fill:none; stroke-width:2; stroke-linejoin:round; stroke-linecap:round; }}
-.line.s1, .cross {{ stroke:var(--s1); }} .line.s2 {{ stroke:var(--s2); }}
-.dot {{ stroke:var(--surface); stroke-width:2; }} .dot.s1 {{ fill:var(--s1); }} .dot.s2 {{ fill:var(--s2); }}
+.line.s1, .cross {{ stroke:var(--s1); }} .line.s2 {{ stroke:var(--s2); }} .line.s3 {{ stroke:var(--s3); }}
+.dot {{ stroke:var(--surface); stroke-width:2; }} .dot.s1 {{ fill:var(--s1); }} .dot.s2 {{ fill:var(--s2); }} .dot.s3 {{ fill:var(--s3); }}
 .cross {{ stroke:var(--muted); stroke-width:1; }}
 .endlabel {{ fill:var(--text2); font-size:11px; }} .endvalue {{ fill:var(--text); font-size:12px; font-weight:600; }}
 #tip {{ position:absolute; top:6px; pointer-events:none; background:var(--surface); border:1px solid var(--border);
@@ -342,7 +382,8 @@ footer {{ margin-top:20px; }}
 <p class="sub">{subtitle} — {period}</p>
 {alert}
 <div class="tiles">{tiles}</div>
-<section><h2>Portefeuille et S&amp;P 500, base 100 au premier jour</h2>{chart}</section>
+<section><h2>Valeur du portefeuille et du S&amp;P 500, base 100 au premier jour</h2>{chart}</section>
+{compare}
 <section><h2>Positions ouvertes</h2>{positions}{pending}</section>
 <section><h2>Le veto du CRO est-il utile ?</h2>{veto}{decisions}</section>
 <section><h2>Derniers trades clôturés</h2>{trades}</section>
@@ -360,6 +401,7 @@ footer {{ margin-top:20px; }}
     cross.setAttribute('x1', d.x[best]); cross.setAttribute('x2', d.x[best]); cross.setAttribute('visibility', 'visible');
     var rows = '';
     d.series.forEach(function (s, k) {{
+      if (s.values[best] === null) {{ dots[k].setAttribute('visibility', 'hidden'); return; }}
       dots[k].setAttribute('cx', d.x[best]); dots[k].setAttribute('cy', s.y[best]); dots[k].setAttribute('visibility', 'visible');
       rows += '<div><i class="swatch ' + s.cls + '"></i>' + s.name + ' <b>' + s.values[best].toFixed(1) + '</b></div>';
     }});
