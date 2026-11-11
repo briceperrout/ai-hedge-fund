@@ -26,7 +26,7 @@ import warnings
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import numpy as np
 import pandas as pd
@@ -45,6 +45,9 @@ log = logging.getLogger("backtest")
 REPORT_DIR = ROOT / "data" / "reports"
 VETO_COOLDOWN_DAYS = int(os.getenv("VETO_COOLDOWN_DAYS", "5"))
 ISO = "%Y-%m-%d"
+
+# Un comité reçoit (signal, dossier) et rend {"decision": VetoDecision, "bull_thesis", "bear_thesis", "error"}.
+Committee = Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]]
 
 
 # ---------------------------------------------------------------------------
@@ -218,9 +221,13 @@ def _journal_trade(trade: dict[str, Any]) -> int:
 def evaluate_signals(day: pd.Timestamp, rows: pd.DataFrame, model, features: list[str], cfg: StrategyConfig, *,
                      prices: dict[str, pd.DataFrame], macro: pd.DataFrame, held: set[str], cooldown: dict[str, str],
                      equity: float, cash: float, slots: int, mode: str, scope: Optional[str],
-                     use_llm: bool, use_memory: bool, decisions: list[dict[str, Any]]) -> tuple[list[PendingOrder], bool]:
+                     use_llm: bool, use_memory: bool, decisions: list[dict[str, Any]],
+                     committee: Optional[Committee] = None, with_dossier: bool = True
+                     ) -> tuple[list[PendingOrder], bool]:
     """Scanne l'univers à la clôture de ``day``.
 
+    ``committee`` remplace le comité LLM par une autre politique de veto (expérience contrôlée) ;
+    ``with_dossier=False`` saute la constitution du dossier quand personne ne le lit.
     Retourne (ordres autorisés à exécuter à la prochaine ouverture, alerte systémique du CRO).
     """
     day_iso = day.strftime(ISO)
@@ -239,17 +246,23 @@ def evaluate_signals(day: pd.Timestamp, rows: pd.DataFrame, model, features: lis
             decisions.append({**record, "outcome": "NO_SLOT"})
             continue
 
-        from data_pipeline.market_snapshot import build_investment_dossier  # import tardif : charge les embeddings
+        dossier: dict[str, Any] = {"ticker": ticker, "as_of": day_iso}
+        context: dict[str, Any] = {}
+        if with_dossier:
+            from data_pipeline.market_snapshot import build_investment_dossier  # import tardif : charge les embeddings
 
-        dossier = build_investment_dossier(ticker, day, prices[ticker].loc[:day], macro.loc[:day],
-                                           mode=mode, scope=scope, use_memory=use_memory)
-        context = {k: dossier[k] for k in ("technical", "macro", "fundamentals", "news", "experience")}
+            dossier = build_investment_dossier(ticker, day, prices[ticker].loc[:day], macro.loc[:day],
+                                               mode=mode, scope=scope, use_memory=use_memory)
+            context = {k: dossier[k] for k in ("technical", "macro", "fundamentals", "news", "experience")}
         log.info("[%s] SIGNAL %s : probabilité %.1f%%", day.date(), ticker, probability * 100)
 
-        if use_llm:
-            from llm_agents.graph import run_committee
+        if use_llm or committee is not None:
+            if committee is None:
+                from llm_agents.graph import run_committee as committee_fn
+            else:
+                committee_fn = committee
 
-            verdict = run_committee({"statistical_action": "BUY", "win_probability": probability}, dossier)
+            verdict = committee_fn({"statistical_action": "BUY", "win_probability": probability}, dossier)
             decision = verdict["decision"]
             context.update(bull_thesis=verdict["bull_thesis"], bear_thesis=verdict["bear_thesis"],
                            cro_justification=decision.justification, risk_level=decision.risk_level,
@@ -390,15 +403,26 @@ def print_report(report: dict[str, Any]) -> None:
 # Boucle temporelle
 # ---------------------------------------------------------------------------
 def run_backtest(start: str, end: str, tickers: list[str], *, capital: float, use_llm: bool, use_memory: bool,
-                 autopsy: bool, retrain_days: int, threshold: Optional[float] = None) -> dict[str, Any]:
+                 autopsy: bool, retrain_days: int, threshold: Optional[float] = None,
+                 committee: Optional[Committee] = None, with_dossier: bool = True, sync: bool = True,
+                 model_cache: Optional[dict[pd.Timestamp, Any]] = None, tag: str = "",
+                 show_report: bool = True) -> dict[str, Any]:
+    """Rejoue la période séance par séance.
+
+    Les paramètres optionnels servent à l'expérience contrôlée (``run_experiment.py``) : ``committee``
+    substitue une autre politique de veto, ``model_cache`` partage les modèles XGBoost entre les bras
+    (mêmes signaux pour tous), ``sync=False`` évite de retélécharger les prix, ``tag`` distingue les rapports.
+    """
     cfg = StrategyConfig.from_env(threshold=threshold)
-    run_id = f"bt-{datetime.now():%Y%m%d-%H%M%S}"
-    print(f"Backtest {run_id} | {start} -> {end} | {len(tickers)} valeurs | seuil {cfg.threshold:.0%} | "
+    run_id = f"bt-{datetime.now():%Y%m%d-%H%M%S}{'-' + tag if tag else ''}"
+    if show_report:
+        print(f"Backtest {run_id} | {start} -> {end} | {len(tickers)} valeurs | seuil {cfg.threshold:.0%} | "
           f"objectif {cfg.tp_atr} ATR / stop {cfg.sl_atr} ATR / {cfg.horizon} séances | "
           f"comité IA : {'actif' if use_llm else 'désactivé (--no-llm)'}", flush=True)
 
-    sync_all(tickers, end=end)
-    if os.getenv("ENABLE_DARK_POOL", "false").lower() == "true":
+    if sync:
+        sync_all(tickers, end=end)
+    if sync and os.getenv("ENABLE_DARK_POOL", "false").lower() == "true":
         sync_dark_pool(tickers, os.getenv("HISTORY_START", "2016-01-01"), end)
     dataset, prices, features = build_dataset(tickers, cfg, end=end)
     macro = load_macro(end=end)
@@ -425,11 +449,16 @@ def run_backtest(start: str, end: str, tickers: list[str], *, capital: float, us
 
         # Walk-forward : ré-entraînement sur les seuls trades dont l'issue est connue ce soir
         if model is None or sessions_since_training >= retrain_days:
-            train = training_rows(dataset, day)
-            assert train["label_end"].max() <= day, "fuite temporelle dans l'échantillon d'entraînement"
-            model, sessions_since_training = train_model(train, features), 0
-            log.info("[%s] XGBoost ré-entraîné sur %d trades simulés (jusqu'au %s)", day.date(), len(train),
-                     train["label_end"].max().date())
+            model = model_cache.get(day) if model_cache is not None else None
+            if model is None:
+                train = training_rows(dataset, day)
+                assert train["label_end"].max() <= day, "fuite temporelle dans l'échantillon d'entraînement"
+                model = train_model(train, features)
+                log.info("[%s] XGBoost ré-entraîné sur %d trades simulés (jusqu'au %s)", day.date(), len(train),
+                         train["label_end"].max().date())
+                if model_cache is not None:
+                    model_cache[day] = model
+            sessions_since_training = 0
         sessions_since_training += 1
 
         if i < len(days) - 1:  # pas de nouveau signal le dernier jour : aucune ouverture pour l'exécuter
@@ -437,7 +466,8 @@ def run_backtest(start: str, end: str, tickers: list[str], *, capital: float, us
                 day, rows, model, features, cfg, prices=prices, macro=macro,
                 held=set(engine.positions) | set(engine.pending), cooldown=engine.cooldown, equity=equity,
                 cash=engine.buying_power(), slots=engine.free_slots(), mode="backtest", scope=run_id,
-                use_llm=use_llm, use_memory=use_memory, decisions=decisions)
+                use_llm=use_llm, use_memory=use_memory, decisions=decisions, committee=committee,
+                with_dossier=with_dossier)
             for order in approved:
                 engine.pending[order.plan.ticker] = order
             if systemic:
@@ -466,8 +496,10 @@ def run_backtest(start: str, end: str, tickers: list[str], *, capital: float, us
     pd.DataFrame(decisions).to_csv(out_dir / "decisions.csv", index=False)
     if engine.closed:
         pd.DataFrame(engine.closed).drop(columns=["context"]).to_csv(out_dir / "trades.csv", index=False)
-    print_report(report)
-    print(f"  Leçons enregistrées dans le journal : {lessons}\n  Rapport : {out_dir}")
+    report["report_dir"] = str(out_dir)
+    if show_report:
+        print_report(report)
+        print(f"  Leçons enregistrées dans le journal : {lessons}\n  Rapport : {out_dir}")
     return report
 
 
