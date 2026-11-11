@@ -140,9 +140,21 @@ def extract_signals(filing: dict[str, Any]) -> dict[str, Any]:
 
 
 def extract_all(tickers: Optional[Iterable[str]] = None, start: Optional[str] = None, end: Optional[str] = None,
-                forms: Optional[Iterable[str]] = None, limit: Optional[int] = None, retry_errors: bool = False) -> int:
-    """Lit tous les dépôts téléchargés qui ne l'ont pas encore été par ce couple de modèles."""
+                forms: Optional[Iterable[str]] = None, limit: Optional[int] = None, retry_errors: bool = False,
+                earnings_only: bool = False, cheapest_first: bool = False, max_hours: Optional[float] = None) -> int:
+    """Lit tous les dépôts téléchargés qui ne l'ont pas encore été par ce couple de modèles.
+
+    ``earnings_only`` se limite aux communiqués de résultats (8-K rubrique 2.02), ``cheapest_first`` lit les
+    documents les plus courts d'abord, ``max_hours`` arrête proprement après cette durée. La lecture s'interrompt
+    aussi après trois pannes consécutives du modèle, pour ne pas enregistrer une nuit d'échecs.
+    """
     filings = load_filings(tickers, start, end, forms)
+    if earnings_only:
+        filings = filings[filings["form"].eq("8-K") & filings["items"].fillna("").str.contains("2.02", regex=False)]
+    if cheapest_first:
+        filings = filings.loc[filings["text"].str.len().sort_values(kind="stable").index]
+    deadline = time.monotonic() + max_hours * 3600 if max_hours else None
+    outages, read = 0, 0
     with db_connect() as con:
         con.executescript(SCHEMA)
         done = {row[0] for row in con.execute(
@@ -151,7 +163,18 @@ def extract_all(tickers: Optional[Iterable[str]] = None, start: Optional[str] = 
     todo = filings[~filings["accession"].isin(done)]
     todo = todo.head(limit) if limit else todo
     for n, (_, filing) in enumerate(todo.iterrows(), 1):
+        if deadline is not None and time.monotonic() > deadline:
+            log.info("Durée maximale atteinte : arrêt après %d dépôt(s), le reste sera lu au prochain lancement.", read)
+            break
         record = extract_signals(filing.to_dict())
+        outage = record["error"] is not None and not record["error"].startswith("JSON invalide")
+        outages = outages + 1 if outage else 0
+        if outages >= 3:  # modèle injoignable : on n'enregistre pas ces échecs, ils seraient pris pour des lectures
+            log.error("Trois pannes consécutives du modèle (%s) : arrêt.", record["error"])
+            break
+        if outage:
+            continue
+        read += 1
         with db_connect() as con:
             con.execute(
                 "INSERT OR REPLACE INTO filing_signals VALUES (:accession, :model, :prompt_version, :signals_json, "
@@ -160,7 +183,7 @@ def extract_all(tickers: Optional[Iterable[str]] = None, start: Optional[str] = 
         status = record["error"] or f"ancrage {record['grounding']:.0%}"
         log.info("[%d/%d] %s %s du %s : %d tranche(s), %.0f s, %s", n, len(todo), filing["ticker"], filing["form"],
                  filing["filed"], record["chunks"], record["seconds"], status)
-    return len(todo)
+    return read
 
 
 def load_signals(model: Optional[str] = None, include_errors: bool = False) -> pd.DataFrame:
@@ -191,11 +214,14 @@ if __name__ == "__main__":
     parser.add_argument("--forms", nargs="*", default=None)
     parser.add_argument("--limit", type=int, default=None, help="Nombre maximal de dépôts à lire.")
     parser.add_argument("--retry-errors", action="store_true", help="Relire les dépôts dont l'extraction a échoué.")
+    parser.add_argument("--earnings-only", action="store_true", help="Seulement les communiqués de résultats (8-K 2.02).")
+    parser.add_argument("--cheapest-first", action="store_true", help="Lire les documents les plus courts d'abord.")
+    parser.add_argument("--max-hours", type=float, default=None, help="Arrêter proprement après cette durée.")
     args = parser.parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M")
     for noisy in ("httpx", "httpcore"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
     print(f"Modèles : notes = {NOTES_MODEL} (Ollama), synthèse = {CRO_MODEL} (LM Studio)")
     count = extract_all([t.upper() for t in args.tickers], args.start, args.end, args.forms, args.limit,
-                        args.retry_errors)
+                        args.retry_errors, args.earnings_only, args.cheapest_first, args.max_hours)
     print(f"{count} dépôt(s) lu(s).")

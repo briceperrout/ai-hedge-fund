@@ -277,3 +277,63 @@ def test_cost_report_and_markdown(monkeypatch):
         "conclusive": False, "reason": "3 dépôts lus", "coverage": 0.1, "filings_read": 1}})
     assert "Non concluant : 3 dépôts lus" in page and "| 10-Q | 1 | 1 |" in page
     assert "Aucun dépôt" in study.render_markdown({"cost": {"documents": 0}, "accuracy": {}, "predictive": {}})
+
+
+# --- Lecture par lots -------------------------------------------------------
+@pytest.fixture
+def batch(monkeypatch, tmp_path):
+    """Trois dépôts factices et une base temporaire ; ``extract_signals`` est remplacé par une doublure."""
+    import sqlite3
+
+    db = tmp_path / "m.db"
+    monkeypatch.setattr(fx, "db_connect", lambda: sqlite3.connect(db))
+    filings = pd.DataFrame({
+        "accession": ["a", "b", "c"], "ticker": "AAPL", "form": ["8-K", "10-Q", "8-K"],
+        "filed": ["2023-02-02", "2023-02-03", "2023-03-10"], "items": ["2.02,9.01", "", "5.07"],
+        "text": ["x" * 300, "x" * 900, "x" * 100]})
+    monkeypatch.setattr(fx, "load_filings", lambda *args, **kwargs: filings)
+    seen: list[str] = []
+
+    def install(error=None):
+        def fake(filing):
+            seen.append(filing["accession"])
+            return {"accession": filing["accession"], "model": fx.MODEL_ID, "prompt_version": fx.PROMPT_VERSION,
+                    "signals_json": None if error else "{}", "grounding": None if error else 1.0, "chunks": 1,
+                    "calls": 1, "input_tokens": 1, "output_tokens": 1, "seconds": 1.0, "error": error,
+                    "created_at": "2026-01-01T00:00:00"}
+        monkeypatch.setattr(fx, "extract_signals", fake)
+
+    def stored() -> int:
+        with sqlite3.connect(db) as con:
+            return con.execute("SELECT COUNT(*) FROM filing_signals").fetchone()[0]
+
+    return install, seen, stored
+
+
+def test_batch_can_target_earnings_and_start_with_short_documents(batch):
+    install, seen, stored = batch
+    install()
+    assert fx.extract_all(earnings_only=True) == 1 and seen == ["a"]
+    seen.clear()
+    assert fx.extract_all(cheapest_first=True) == 2 and seen == ["c", "b"]       # « a » est déjà lu
+    assert fx.extract_all() == 0 and stored() == 3
+
+
+def test_batch_stops_on_model_outage_without_recording_failures(batch):
+    install, seen, stored = batch
+    install(error="ConnectError: Ollama éteint")
+    assert fx.extract_all() == 0 and stored() == 0          # rien n'est marqué comme lu : tout sera repris
+
+
+def test_invalid_json_is_recorded_as_a_real_reading_failure(batch):
+    install, seen, stored = batch
+    install(error="JSON invalide : demand_tone hors bornes")
+    assert fx.extract_all() == 3 and stored() == 3          # échec du modèle sur le fond, pas une panne
+
+
+def test_batch_respects_the_time_budget(batch, monkeypatch):
+    install, seen, stored = batch
+    install()
+    clock = iter([0.0, 10.0, 4000.0, 8000.0, 12000.0])
+    monkeypatch.setattr(fx.time, "monotonic", lambda: next(clock))
+    assert fx.extract_all(max_hours=1.0) == 1 and seen == ["a"]
